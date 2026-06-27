@@ -1,15 +1,9 @@
 {
     "author": "nicholas.dietrich@gmail.com",
-    "dependencies": {
-        "pebble-clay": "^1.0.4"
-    },
+    "dependencies": {},
     "keywords": [],
     "name": "transport-for-nick",
     "pebble": {
-        "capabilities": [
-            "location",
-            "configurable"
-        ],
         "displayName": "transport-for-nick",
         "enableMultiJS": true,
         "messageKeys": [
@@ -30,13 +24,6 @@
             "media": []
         },
         "sdkVersion": "3",
-        "targetPlatforms": [
-            "aplite",
-            "basalt",
-            "chalk",
-            "diorite",
-            "emery"
-        ],
         "uuid": "4910fe9f-c424-4f15-835b-7136bdf5edfb",
         "watchapp": {
             "watchface": false
