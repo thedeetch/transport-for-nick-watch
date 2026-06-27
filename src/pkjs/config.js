@@ -13,7 +13,7 @@ var clayConfig = [
                 "defaultValue": "",
                 "label": "TfL API Key",
                 "attributes": {
-                    "placeholder": "655c2b6bf1a8497ea9e72ec6e80420fa"
+                    "placeholder": "1234abcd567890"
                 }
             }
         ]

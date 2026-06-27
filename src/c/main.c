@@ -1,11 +1,18 @@
 #include <pebble.h>
 #include <message_keys.auto.h>
 
-#define MAX_ARRIVALS 12
+#define MAX_STOPS 6
+#define MAX_ARRIVALS 15
 #define CELL_HEIGHT 44
 
 typedef struct {
-  char station[32];
+  char name[32];
+  char detail[32];
+  int type; // 0 for Tube, 1 for Bus
+} StopItem;
+
+typedef struct {
+  int stop_id; // Links to stop index (0 to s_stop_count-1)
   char route[16];
   char direction[32];
   int eta;
@@ -13,11 +20,19 @@ typedef struct {
 } ArrivalItem;
 
 static Window *s_main_window;
-static MenuLayer *s_menu_layer;
+static Window *s_arrivals_window;
+
+static MenuLayer *s_stops_menu_layer;
+static MenuLayer *s_arrivals_menu_layer;
 static TextLayer *s_status_layer;
+
+static StopItem s_stops[MAX_STOPS];
+static int s_stop_count = 0;
 
 static ArrivalItem s_arrivals[MAX_ARRIVALS];
 static int s_arrival_count = 0;
+
+static int s_selected_stop_index = 0;
 static char s_status_text[64];
 static AppTimer *s_refresh_timer = NULL;
 static bool s_updating = false;
@@ -26,45 +41,93 @@ static bool s_updating = false;
 static void request_update(void);
 static void refresh_timer_callback(void *data);
 
-// Clean out existing data
-static void clear_arrivals(void) {
+// Clear out existing data
+static void clear_data(void) {
+  s_stop_count = 0;
   s_arrival_count = 0;
+  memset(s_stops, 0, sizeof(s_stops));
   memset(s_arrivals, 0, sizeof(s_arrivals));
-  menu_layer_reload_data(s_menu_layer);
-}
-
-// Format arrival string
-static void format_arrival_text(char *buffer, size_t buffer_len, const ArrivalItem *item) {
-  // e.g., "In 5 min" or "Due"
-  if (item->eta <= 0) {
-    snprintf(buffer, buffer_len, "Due");
-  } else {
-    snprintf(buffer, buffer_len, "In %d min", item->eta);
+  
+  if (s_stops_menu_layer) {
+    menu_layer_reload_data(s_stops_menu_layer);
+  }
+  if (s_arrivals_menu_layer) {
+    menu_layer_reload_data(s_arrivals_menu_layer);
   }
 }
 
-// Format route / direction header string
-static void format_route_direction(char *buffer, size_t buffer_len, const ArrivalItem *item) {
-  // e.g., "Bus 12 -> Oxford Circus" or "Victoria -> Northbound"
-  char *type_str = (item->type == 0) ? "Tube" : "Bus";
-  snprintf(buffer, buffer_len, "[%s %s] %s", type_str, item->route, item->direction);
+// Get number of arrivals for currently selected stop
+static int get_arrivals_count_for_selected_stop(void) {
+  int count = 0;
+  for (int i = 0; i < s_arrival_count; i++) {
+    if (s_arrivals[i].stop_id == s_selected_stop_index) {
+      count++;
+    }
+  }
+  return count;
+}
+
+// Get the N-th arrival belonging to the selected stop
+static ArrivalItem* get_arrival_at_row(int row) {
+  int current_row = 0;
+  for (int i = 0; i < s_arrival_count; i++) {
+    if (s_arrivals[i].stop_id == s_selected_stop_index) {
+      if (current_row == row) {
+        return &s_arrivals[i];
+      }
+      current_row++;
+    }
+  }
+  return NULL;
 }
 
 // AppMessage Inbox Callback
 static void inbox_received_callback(DictionaryIterator *iterator, void *context) {
   Tuple *clean_tuple = dict_find(iterator, MESSAGE_KEY_DATA_CLEAN);
   if (clean_tuple) {
-    APP_LOG(APP_LOG_LEVEL_INFO, "C side: cleaning arrivals");
-    clear_arrivals();
+    APP_LOG(APP_LOG_LEVEL_INFO, "C side: cleaning lists");
+    clear_data();
   }
 
   Tuple *status_tuple = dict_find(iterator, MESSAGE_KEY_STATUS_MSG);
   if (status_tuple) {
     snprintf(s_status_text, sizeof(s_status_text), "%s", status_tuple->value->cstring);
-    text_layer_set_text(s_status_layer, s_status_text);
+    if (s_status_layer) {
+      text_layer_set_text(s_status_layer, s_status_text);
+    }
     APP_LOG(APP_LOG_LEVEL_INFO, "C side status: %s", s_status_text);
   }
 
+  // Handle incoming Stops
+  Tuple *stop_index_tuple = dict_find(iterator, MESSAGE_KEY_STOP_INDEX);
+  Tuple *stop_count_tuple = dict_find(iterator, MESSAGE_KEY_STOP_COUNT);
+  if (stop_index_tuple && stop_count_tuple) {
+    int index = stop_index_tuple->value->int32;
+    int count = stop_count_tuple->value->int32;
+
+    if (index >= 0 && index < MAX_STOPS) {
+      Tuple *name_tuple = dict_find(iterator, MESSAGE_KEY_STOP_NAME);
+      Tuple *detail_tuple = dict_find(iterator, MESSAGE_KEY_STOP_DETAIL);
+      Tuple *type_tuple = dict_find(iterator, MESSAGE_KEY_STOP_TYPE);
+
+      if (name_tuple && detail_tuple && type_tuple) {
+        snprintf(s_stops[index].name, sizeof(s_stops[index].name), "%s", name_tuple->value->cstring);
+        snprintf(s_stops[index].detail, sizeof(s_stops[index].detail), "%s", detail_tuple->value->cstring);
+        s_stops[index].type = type_tuple->value->int32;
+
+        if (index + 1 > s_stop_count) {
+          s_stop_count = index + 1;
+        }
+
+        APP_LOG(APP_LOG_LEVEL_INFO, "Added Stop %d/%d: %s (%s)", index + 1, count, s_stops[index].name, s_stops[index].detail);
+        if (s_stops_menu_layer) {
+          menu_layer_reload_data(s_stops_menu_layer);
+        }
+      }
+    }
+  }
+
+  // Handle incoming Arrivals
   Tuple *index_tuple = dict_find(iterator, MESSAGE_KEY_DATA_INDEX);
   Tuple *count_tuple = dict_find(iterator, MESSAGE_KEY_DATA_COUNT);
   if (index_tuple && count_tuple) {
@@ -72,14 +135,14 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     int count = count_tuple->value->int32;
 
     if (index >= 0 && index < MAX_ARRIVALS) {
-      Tuple *station_tuple = dict_find(iterator, MESSAGE_KEY_DATA_STATION);
+      Tuple *stop_id_tuple = dict_find(iterator, MESSAGE_KEY_DATA_STOP_ID);
       Tuple *route_tuple = dict_find(iterator, MESSAGE_KEY_DATA_ROUTE);
       Tuple *dir_tuple = dict_find(iterator, MESSAGE_KEY_DATA_DIRECTION);
       Tuple *eta_tuple = dict_find(iterator, MESSAGE_KEY_DATA_ETA);
       Tuple *type_tuple = dict_find(iterator, MESSAGE_KEY_DATA_TYPE);
 
-      if (station_tuple && route_tuple && dir_tuple && eta_tuple && type_tuple) {
-        snprintf(s_arrivals[index].station, sizeof(s_arrivals[index].station), "%s", station_tuple->value->cstring);
+      if (stop_id_tuple && route_tuple && dir_tuple && eta_tuple && type_tuple) {
+        s_arrivals[index].stop_id = stop_id_tuple->value->int32;
         snprintf(s_arrivals[index].route, sizeof(s_arrivals[index].route), "%s", route_tuple->value->cstring);
         snprintf(s_arrivals[index].direction, sizeof(s_arrivals[index].direction), "%s", dir_tuple->value->cstring);
         s_arrivals[index].eta = eta_tuple->value->int32;
@@ -89,8 +152,14 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
           s_arrival_count = index + 1;
         }
 
-        APP_LOG(APP_LOG_LEVEL_INFO, "Added arrival %d: %s %s - %d min", index, s_arrivals[index].station, s_arrivals[index].route, s_arrivals[index].eta);
-        menu_layer_reload_data(s_menu_layer);
+        APP_LOG(APP_LOG_LEVEL_INFO, "Added Arrival %d/%d: StopId %d, Route %s - %d min", index + 1, count, s_arrivals[index].stop_id, s_arrivals[index].route, s_arrivals[index].eta);
+        
+        if (s_stops_menu_layer) {
+          menu_layer_reload_data(s_stops_menu_layer);
+        }
+        if (s_arrivals_menu_layer) {
+          menu_layer_reload_data(s_arrivals_menu_layer);
+        }
       }
     }
   }
@@ -99,14 +168,18 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
 static void inbox_dropped_callback(AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "Message dropped. Reason: %d", reason);
   snprintf(s_status_text, sizeof(s_status_text), "Error %d", reason);
-  text_layer_set_text(s_status_layer, s_status_text);
+  if (s_status_layer) {
+    text_layer_set_text(s_status_layer, s_status_text);
+  }
 }
 
 static void outbox_failed_callback(DictionaryIterator *iterator, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "Outbox send failed! Reason: %d", reason);
   s_updating = false;
   snprintf(s_status_text, sizeof(s_status_text), "Update failed");
-  text_layer_set_text(s_status_layer, s_status_text);
+  if (s_status_layer) {
+    text_layer_set_text(s_status_layer, s_status_text);
+  }
 }
 
 static void outbox_sent_callback(DictionaryIterator *iterator, void *context) {
@@ -121,7 +194,9 @@ static void request_update(void) {
   }
   s_updating = true;
   snprintf(s_status_text, sizeof(s_status_text), "Updating...");
-  text_layer_set_text(s_status_layer, s_status_text);
+  if (s_status_layer) {
+    text_layer_set_text(s_status_layer, s_status_text);
+  }
 
   DictionaryIterator *iter;
   app_message_outbox_begin(&iter);
@@ -140,63 +215,110 @@ static void refresh_timer_callback(void *data) {
   s_refresh_timer = app_timer_register(30000, refresh_timer_callback, NULL);
 }
 
-// Click Select button to manually update
-static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  request_update();
+// --- Menu Layer Callbacks for Main Stops Menu ---
+
+static uint16_t get_stop_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *context) {
+  return s_stop_count;
 }
 
-static void click_config_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
-}
-
-// Menu Layer Callbacks
-static uint16_t get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *context) {
-  return s_arrival_count;
-}
-
-static int16_t get_cell_height_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *context) {
+static int16_t get_stop_cell_height_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *context) {
   return CELL_HEIGHT;
 }
 
-static void draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *context) {
-  int index = cell_index->row;
-  if (index < s_arrival_count) {
-    ArrivalItem *item = &s_arrivals[index];
+static void draw_stop_row_callback(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *context) {
+  int row = cell_index->row;
+  if (row < s_stop_count) {
+    StopItem *item = &s_stops[row];
+    char subtitle_buf[64];
+    char *type_str = (item->type == 0) ? "Tube" : "Bus";
+    snprintf(subtitle_buf, sizeof(subtitle_buf), "[%s] %s", type_str, item->detail);
+    menu_cell_basic_draw(ctx, cell_layer, item->name, subtitle_buf, NULL);
+  }
+}
 
-    char title_buf[64];
-    format_route_direction(title_buf, sizeof(title_buf), item);
+static void select_stop_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *context) {
+  s_selected_stop_index = cell_index->row;
+  if (s_selected_stop_index < s_stop_count) {
+    window_stack_push(s_arrivals_window, true);
+  }
+}
 
-    char eta_buf[16];
-    format_arrival_text(eta_buf, sizeof(eta_buf), item);
+// --- Menu Layer Callbacks for Arrivals Window ---
 
-    // Draw station name as header / main text, and the route + ETA as detailed text
-    menu_cell_basic_draw(ctx, cell_layer, item->station, title_buf, NULL);
+static uint16_t get_arrivals_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *context) {
+  int count = get_arrivals_count_for_selected_stop();
+  return (count == 0) ? 1 : count;
+}
+
+static int16_t get_arrivals_cell_height_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *context) {
+  return CELL_HEIGHT;
+}
+
+static int16_t get_arrivals_header_height_callback(MenuLayer *menu_layer, uint16_t section_index, void *context) {
+  return 24;
+}
+
+static void draw_arrivals_header_callback(GContext *ctx, const Layer *cell_layer, uint16_t section_index, void *context) {
+  if (s_selected_stop_index < s_stop_count) {
+    StopItem *stop = &s_stops[s_selected_stop_index];
+    char header_buf[64];
+    snprintf(header_buf, sizeof(header_buf), "%s", stop->name);
+    menu_cell_basic_header_draw(ctx, cell_layer, header_buf);
+  }
+}
+
+static void draw_arrival_row_callback(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *context) {
+  int row = cell_index->row;
+  int count = get_arrivals_count_for_selected_stop();
+
+  if (count == 0) {
+    menu_cell_basic_draw(ctx, cell_layer, "No departures", "Check again later", NULL);
+    return;
+  }
+
+  ArrivalItem *item = get_arrival_at_row(row);
+  if (item) {
+    char subtitle_buf[64];
+    if (item->type == 0) {
+      snprintf(subtitle_buf, sizeof(subtitle_buf), "Tube - Line %s", item->route);
+    } else {
+      snprintf(subtitle_buf, sizeof(subtitle_buf), "Bus %s", item->route);
+    }
+
+    menu_cell_basic_draw(ctx, cell_layer, item->direction, subtitle_buf, NULL);
 
     // Draw the ETA on the right-hand side of the cell
     GRect bounds = layer_get_bounds(cell_layer);
     graphics_context_set_text_color(ctx, GColorBlack);
     
     #ifdef PBL_COLOR
-    // On color watches, highlight soonest or different types
     if (item->type == 0) {
-      graphics_context_set_text_color(ctx, GColorDarkCandyAppleRed); // Reddish for Tube
+      graphics_context_set_text_color(ctx, GColorDarkCandyAppleRed); // Red for Tube
     } else {
-      graphics_context_set_text_color(ctx, GColorCobaltBlue); // Bluish for Bus
+      graphics_context_set_text_color(ctx, GColorCobaltBlue); // Blue for Bus
     }
     #endif
 
-    GRect eta_rect = GRect(bounds.size.w - 75, 4, 70, bounds.size.h - 8);
+    char eta_buf[16];
+    if (item->eta <= 0) {
+      snprintf(eta_buf, sizeof(eta_buf), "Due");
+    } else {
+      snprintf(eta_buf, sizeof(eta_buf), "%d min", item->eta);
+    }
+
+    GRect eta_rect = GRect(bounds.size.w - 75, 12, 70, 20);
     graphics_draw_text(ctx, eta_buf, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
                        eta_rect, GTextOverflowModeWordWrap, GTextAlignmentRight, NULL);
   }
 }
 
-// Window Load/Unload
+// --- Window Loading and Unloading ---
+
 static void main_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
 
-  // Status Bar / Info Text at bottom
+  // Status Bar at bottom
   s_status_layer = text_layer_create(GRect(0, bounds.size.h - 20, bounds.size.w, 20));
   text_layer_set_text(s_status_layer, "Loading...");
   text_layer_set_text_alignment(s_status_layer, GTextAlignmentCenter);
@@ -204,23 +326,41 @@ static void main_window_load(Window *window) {
   layer_add_child(window_layer, text_layer_get_layer(s_status_layer));
 
   // Menu Layer filling rest of screen
-  s_menu_layer = menu_layer_create(GRect(0, 0, bounds.size.w, bounds.size.h - 20));
-  menu_layer_set_callbacks(s_menu_layer, NULL, (MenuLayerCallbacks) {
-    .get_num_rows = get_num_rows_callback,
-    .get_cell_height = get_cell_height_callback,
-    .draw_row = draw_row_callback,
+  s_stops_menu_layer = menu_layer_create(GRect(0, 0, bounds.size.w, bounds.size.h - 20));
+  menu_layer_set_callbacks(s_stops_menu_layer, NULL, (MenuLayerCallbacks) {
+    .get_num_rows = get_stop_num_rows_callback,
+    .get_cell_height = get_stop_cell_height_callback,
+    .draw_row = draw_stop_row_callback,
+    .select_click = select_stop_callback,
   });
-  menu_layer_set_click_config_onto_window(s_menu_layer, window);
-  
-  // Register click config for manual select trigger
-  window_set_click_config_provider(s_main_window, click_config_provider);
+  menu_layer_set_click_config_onto_window(s_stops_menu_layer, window);
 
-  layer_add_child(window_layer, menu_layer_get_layer(s_menu_layer));
+  layer_add_child(window_layer, menu_layer_get_layer(s_stops_menu_layer));
 }
 
 static void main_window_unload(Window *window) {
-  menu_layer_destroy(s_menu_layer);
+  menu_layer_destroy(s_stops_menu_layer);
   text_layer_destroy(s_status_layer);
+}
+
+static void arrivals_window_load(Window *window) {
+  Layer *window_layer = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(window_layer);
+
+  s_arrivals_menu_layer = menu_layer_create(bounds);
+  menu_layer_set_callbacks(s_arrivals_menu_layer, NULL, (MenuLayerCallbacks) {
+    .get_num_rows = get_arrivals_num_rows_callback,
+    .get_cell_height = get_arrivals_cell_height_callback,
+    .draw_row = draw_arrival_row_callback,
+    .get_header_height = get_arrivals_header_height_callback,
+    .draw_header = draw_arrivals_header_callback,
+  });
+  menu_layer_set_click_config_onto_window(s_arrivals_menu_layer, window);
+  layer_add_child(window_layer, menu_layer_get_layer(s_arrivals_menu_layer));
+}
+
+static void arrivals_window_unload(Window *window) {
+  menu_layer_destroy(s_arrivals_menu_layer);
 }
 
 static void init(void) {
@@ -229,6 +369,13 @@ static void init(void) {
     .load = main_window_load,
     .unload = main_window_unload,
   });
+
+  s_arrivals_window = window_create();
+  window_set_window_handlers(s_arrivals_window, (WindowHandlers) {
+    .load = arrivals_window_load,
+    .unload = arrivals_window_unload,
+  });
+
   window_stack_push(s_main_window, true);
 
   // Register AppMessage callbacks
@@ -253,6 +400,7 @@ static void deinit(void) {
     s_refresh_timer = NULL;
   }
   window_destroy(s_main_window);
+  window_destroy(s_arrivals_window);
 }
 
 int main(void) {

@@ -23,7 +23,13 @@
             "DATA_CLEAN",
             "DATA_TYPE",
             "REQ_UPDATE",
-            "STATUS_MSG"
+            "STATUS_MSG",
+            "STOP_INDEX",
+            "STOP_COUNT",
+            "STOP_NAME",
+            "STOP_DETAIL",
+            "STOP_TYPE",
+            "DATA_STOP_ID"
         ],
         "projectType": "native",
         "resources": {

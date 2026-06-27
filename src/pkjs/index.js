@@ -18,7 +18,7 @@ function loadSettings() {
 Pebble.addEventListener('ready', function(e) {
     console.log('PebbleKit JS ready!');
     loadSettings();
-    // Fetch arrivals on launch
+    // Fetch stops and arrivals on launch
     fetchLocationAndArrivals();
 });
 
@@ -41,7 +41,7 @@ Pebble.addEventListener('appmessage', function(e) {
 Pebble.addEventListener('webviewclosed', function(e) {
     console.log('Webview closed');
     loadSettings();
-    // Notify C side about updated settings or fetch immediately
+    // Fetch immediately on config close
     fetchLocationAndArrivals();
 });
 
@@ -56,36 +56,53 @@ function sendStatus(message) {
     });
 }
 
-// Send clean slate message to C side before sending new batch of arrivals
+// Global Message Queue to stream updates reliably
+var messageQueue = [];
+var isSendingQueue = false;
+
+function queueMessage(dict) {
+    messageQueue.push(dict);
+    if (!isSendingQueue) {
+        isSendingQueue = true;
+        sendNextQueuedMessage();
+    }
+}
+
+function sendNextQueuedMessage() {
+    if (messageQueue.length === 0) {
+        isSendingQueue = false;
+        sendStatus("Done");
+        return;
+    }
+
+    var dict = messageQueue[0];
+    Pebble.sendAppMessage(dict, function() {
+        console.log('Successfully sent message to watch: ' + JSON.stringify(dict));
+        messageQueue.shift();
+        setTimeout(sendNextQueuedMessage, 150); // 150ms delay between messages
+    }, function(err) {
+        console.log('Failed to send message: ' + JSON.stringify(err) + '. Retrying...');
+        // Retry up to 3 times
+        dict.retryCount = (dict.retryCount || 0) + 1;
+        if (dict.retryCount < 3) {
+            setTimeout(sendNextQueuedMessage, 1000);
+        } else {
+            messageQueue.shift();
+            setTimeout(sendNextQueuedMessage, 150);
+        }
+    });
+}
+
+// Clear watch lists before streaming new update
 function sendClean() {
+    messageQueue = []; // Clear any pending sends
+    isSendingQueue = false;
     Pebble.sendAppMessage({
         "DATA_CLEAN": 1
     }, function() {
         console.log('Sent clean command to watch');
     }, function(e) {
         console.log('Failed to send clean command: ' + JSON.stringify(e));
-    });
-}
-
-// Send an arrival item to the C side
-function sendArrival(index, count, station, route, direction, eta, type) {
-    var dict = {
-        "DATA_INDEX": index,
-        "DATA_COUNT": count,
-        "DATA_STATION": station.substring(0, 31), // limit length for C buffer safety
-        "DATA_ROUTE": route.substring(0, 15),
-        "DATA_DIRECTION": direction.substring(0, 31),
-        "DATA_ETA": parseInt(eta),
-        "DATA_TYPE": parseInt(type) // 0 for Tube, 1 for Bus
-    };
-    Pebble.sendAppMessage(dict, function() {
-        console.log('Sent arrival ' + index + '/' + count + ' to watch');
-    }, function(err) {
-        console.log('Failed to send arrival ' + index + ': ' + JSON.stringify(err));
-        // Retry once
-        setTimeout(function() {
-            Pebble.sendAppMessage(dict, function() {}, function() {});
-        }, 1000);
     });
 }
 
@@ -113,7 +130,6 @@ function getTfLArrivals(lat, lon) {
     sendStatus("Fetching stops...");
     
     // We want both Tube (NaptanMetroStation) and Bus (NaptanPublicBusCoachTram) stop types.
-    // Querying within a 600-meter radius to find nearest StopPoints.
     var stopTypes = "NaptanMetroStation,NaptanPublicBusCoachTram";
     var radius = 600;
     var url = "https://api.tfl.gov.uk/StopPoint?lat=" + lat + "&lon=" + lon + 
@@ -155,7 +171,6 @@ function getTfLArrivals(lat, lon) {
                         }
                     }
                     
-                    // Also check stopType if modes didn't classify it clearly
                     if (sp.stopType === 'NaptanMetroStation') {
                         isTube = true;
                     } else if (sp.stopType === 'NaptanPublicBusCoachTram' || sp.stopType === 'NaptanOnstreetBusCoachStopPair') {
@@ -179,7 +194,7 @@ function getTfLArrivals(lat, lon) {
                 tubeStops.sort(function(a, b) { return a.distance - b.distance; });
                 busStops.sort(function(a, b) { return a.distance - b.distance; });
                 
-                // Select nearest tube station and nearest bus stops (up to 2 bus stops and 1 tube station to keep it balanced)
+                // Select nearest tube stations and bus stops
                 var selectedStops = [];
                 
                 if (tubeStops.length > 0) {
@@ -192,11 +207,10 @@ function getTfLArrivals(lat, lon) {
                 }
                 
                 if (selectedStops.length === 0) {
-                    sendStatus("No tube/bus stops found");
+                    sendStatus("No stops found");
                     return;
                 }
                 
-                // Fetch arrivals for all selected stops
                 fetchArrivalsForStops(selectedStops);
                 
             } catch (ex) {
@@ -217,7 +231,7 @@ function getTfLArrivals(lat, lon) {
 // Fetch arrivals for multiple selected stops, sort them, and send to C
 function fetchArrivalsForStops(stops) {
     sendStatus("Fetching arrivals...");
-    var allArrivals = [];
+    var rawArrivals = [];
     var pendingRequests = stops.length;
     
     if (pendingRequests === 0) {
@@ -243,20 +257,13 @@ function fetchArrivalsForStops(stops) {
                     console.log('Got ' + arrivals.length + ' arrivals for stop ' + stop.name);
                     
                     arrivals.forEach(function(arr) {
-                        // Keep track of arrival details
-                        var stationName = stop.name;
-                        var route = arr.lineName || "?";
-                        var direction = arr.towards || arr.destinationName || "Unknown";
-                        var etaSeconds = arr.timeToStation || 0; // ETA in seconds
-                        var type = stop.isTube ? 0 : 1; // 0 for tube, 1 for bus
-                        
-                        allArrivals.push({
-                            station: stationName,
-                            route: route,
-                            direction: direction,
-                            eta: Math.round(etaSeconds / 60), // ETA in minutes
-                            type: type,
-                            distance: stop.distance
+                        rawArrivals.push({
+                            stop: stop,
+                            route: arr.lineName || "?",
+                            direction: arr.towards || arr.destinationName || "Unknown",
+                            etaSeconds: arr.timeToStation || 0,
+                            platformName: arr.platformName || "",
+                            towards: arr.towards || ""
                         });
                     });
                 } catch (e) {
@@ -268,57 +275,137 @@ function fetchArrivalsForStops(stops) {
             
             // Once all requests are complete, process and send
             if (pendingRequests === 0) {
-                processAndSendArrivals(allArrivals);
+                processAndSendMultiScreen(rawArrivals);
             }
         };
         xhr.onerror = function() {
             pendingRequests--;
             console.log('Network error fetching arrivals for ' + stop.name);
             if (pendingRequests === 0) {
-                processAndSendArrivals(allArrivals);
+                processAndSendMultiScreen(rawArrivals);
             }
         };
         xhr.send();
     });
 }
 
-function processAndSendArrivals(arrivals) {
+function processAndSendMultiScreen(arrivals) {
     if (arrivals.length === 0) {
         sendStatus("No upcoming arrivals");
         return;
     }
-    
-    // Sort arrivals by:
-    // 1. Station Name (grouping by station)
-    // 2. ETA (ascending, so soonest is first)
-    arrivals.sort(function(a, b) {
-        if (a.station !== b.station) {
-            return a.station < b.station ? -1 : 1;
+
+    // Group arrivals by Stop + Direction/Platform separately
+    var stopsMap = {};
+    var stopsList = [];
+    var tempArrivals = [];
+
+    arrivals.forEach(function(arr) {
+        var stopName = arr.stop.name;
+        // Clean up names for Pebble's small screens
+        stopName = stopName.replace(" Underground Station", "");
+        stopName = stopName.replace(" DLR Station", "");
+        stopName = stopName.replace(" Overground Station", "");
+        stopName = stopName.replace(" Coach Station", "");
+        stopName = stopName.replace(" Rail Station", "");
+        
+        // Use platform name (like "Northbound - Platform 1" or "Stop L") or towards
+        var stopDetail = arr.platformName || arr.towards || "";
+        if (!stopDetail && arr.stop.isBus) {
+            stopDetail = "Bus Stop";
+        } else if (!stopDetail) {
+            stopDetail = "Departures";
+        }
+
+        // Create a unique key for grouping Stop + Direction/Platform
+        var key = arr.stop.id + "_" + stopDetail;
+        if (stopsMap[key] === undefined) {
+            stopsMap[key] = {
+                tempId: stopsList.length,
+                name: stopName,
+                detail: stopDetail,
+                distance: arr.stop.distance,
+                type: arr.stop.isTube ? 0 : 1
+            };
+            stopsList.push(stopsMap[key]);
+        }
+
+        tempArrivals.push({
+            tempStopId: stopsMap[key].tempId,
+            route: arr.route,
+            direction: arr.direction,
+            eta: Math.round(arr.etaSeconds / 60),
+            type: arr.stop.isTube ? 0 : 1
+        });
+    });
+
+    // Sort the stops by proximity (closest first) so the closest stop is at the top
+    stopsList.sort(function(a, b) {
+        return a.distance - b.distance;
+    });
+
+    // Limit to max 6 stops on the watch screen for best performance
+    stopsList = stopsList.slice(0, 6);
+
+    // Map old tempId to new sorted id, and prepare an allowed check
+    var idMap = {};
+    var allowedStopIds = {};
+    stopsList.forEach(function(stop, index) {
+        idMap[stop.tempId] = index;
+        stop.id = index;
+        allowedStopIds[index] = true;
+    });
+
+    // Translate tempStopId to final sorted stopId and filter out excess stops
+    var finalArrivals = [];
+    tempArrivals.forEach(function(arr) {
+        var finalId = idMap[arr.tempStopId];
+        if (finalId !== undefined && allowedStopIds[finalId] === true) {
+            arr.stopId = finalId;
+            delete arr.tempStopId;
+            finalArrivals.push(arr);
+        }
+    });
+
+    // Sort finalArrivals by stopId, then by ETA (soonest first)
+    finalArrivals.sort(function(a, b) {
+        if (a.stopId !== b.stopId) {
+            return a.stopId - b.stopId;
         }
         return a.eta - b.eta;
     });
-    
-    // Limit to max 12 arrivals to prevent overloading Pebble's limited memory/AppMessage queue
-    var maxArrivals = Math.min(arrivals.length, 12);
-    console.log('Sending ' + maxArrivals + ' sorted arrivals to watch...');
-    
-    // Send clean command first
+
+    // Limit total arrivals to 15 to prevent memory overflow on the watch
+    finalArrivals = finalArrivals.slice(0, 15);
+
+    console.log('Prepared ' + stopsList.length + ' stops and ' + finalArrivals.length + ' arrivals. Streaming to watch...');
+
+    // 1. Send DATA_CLEAN to start with a fresh slate on the watch
     sendClean();
-    
-    // Send arrivals one by one with a small delay to avoid packet loss
-    var sendIndex = 0;
-    
-    function sendNext() {
-        if (sendIndex < maxArrivals) {
-            var arr = arrivals[sendIndex];
-            sendArrival(sendIndex, maxArrivals, arr.station, arr.route, arr.direction, arr.eta, arr.type);
-            sendIndex++;
-            setTimeout(sendNext, 400); // 400ms delay between messages
-        } else {
-            sendStatus("Done");
-        }
-    }
-    
-    // Start sending after a brief delay to allow clean command to process
-    setTimeout(sendNext, 500);
+
+    // 2. Queue all the stops to be sent
+    stopsList.forEach(function(stop, index) {
+        queueMessage({
+            "STOP_INDEX": index,
+            "STOP_COUNT": stopsList.length,
+            "STOP_NAME": stop.name.substring(0, 31),
+            "STOP_DETAIL": stop.detail.substring(0, 31),
+            "STOP_TYPE": parseInt(stop.type)
+        });
+    });
+
+    // 3. Queue all the arrivals to be sent
+    finalArrivals.forEach(function(arr, index) {
+        queueMessage({
+            "DATA_INDEX": index,
+            "DATA_COUNT": finalArrivals.length,
+            "DATA_STOP_ID": parseInt(arr.stopId),
+            "DATA_ROUTE": arr.route.substring(0, 15),
+            "DATA_DIRECTION": arr.direction.substring(0, 31),
+            "DATA_ETA": parseInt(arr.eta),
+            "DATA_TYPE": parseInt(arr.type)
+        });
+    });
+
+    // The queue will automatically start sending, transitioning s_status_text to "Done" upon completion!
 }
