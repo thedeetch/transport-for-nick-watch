@@ -1,0 +1,21 @@
+{
+    "author": "nicholas.dietrich@gmail.com",
+    "dependencies": {},
+    "keywords": [],
+    "name": "transport-for-nick",
+    "pebble": {
+        "displayName": "transport-for-nick",
+        "enableMultiJS": true,
+        "messageKeys": [],
+        "projectType": "native",
+        "resources": {
+            "media": []
+        },
+        "sdkVersion": "3",
+        "uuid": "4910fe9f-c424-4f15-835b-7136bdf5edfb",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.0.0"
+}
